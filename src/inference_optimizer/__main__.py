@@ -7,6 +7,7 @@ import sys
 from .analysis.compare import engine_comparison
 from .gpu_requirements import print_requirements_table
 from .loop.optimizer import InferenceOptimizer
+from .report.charts import generate_all_charts, optimization_delta_chart
 from .report.console import (
     print_bottleneck_summary,
     print_engine_comparison,
@@ -98,6 +99,16 @@ async def cmd_sweep(args: argparse.Namespace) -> None:
     print(f"  JSON: {paths['json']}")
     print(f"  CSV:  {paths['csv']}")
 
+    # Generate charts
+    print("\nGenerating charts...", end=" ", flush=True)
+    try:
+        chart_paths = generate_all_charts(cells, cfg.output_dir)
+        print(f"done — {len(chart_paths)} charts saved to {cfg.output_dir}/charts/")
+        for p in chart_paths:
+            print(f"  {p}")
+    except ImportError as e:
+        print(f"skipped ({e})")
+
 
 async def cmd_optimize(args: argparse.Namespace) -> None:
     cfg = _build_config_from_args(args)
@@ -115,15 +126,25 @@ async def cmd_optimize(args: argparse.Namespace) -> None:
     finally:
         await optimizer.runner.close()
 
-    paths = save_results(
-        # Gather all cells from history
-        [c for run in optimizer.history for c in run.after_cells],
-        cfg.output_dir,
-        label="optimized",
-    )
+    all_cells = [c for run in optimizer.history for c in run.after_cells]
+    paths = save_results(all_cells, cfg.output_dir, label="optimized")
     print(f"\nResults saved:")
     print(f"  JSON: {paths['json']}")
     print(f"  CSV:  {paths['csv']}")
+
+    # Generate charts including before/after optimization delta
+    print("\nGenerating charts...", end=" ", flush=True)
+    try:
+        chart_paths = generate_all_charts(
+            all_cells,
+            cfg.output_dir,
+            optimization_runs=optimizer.history,
+        )
+        print(f"done — {len(chart_paths)} charts saved to {cfg.output_dir}/charts/")
+        for p in chart_paths:
+            print(f"  {p}")
+    except ImportError as e:
+        print(f"skipped ({e})")
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
