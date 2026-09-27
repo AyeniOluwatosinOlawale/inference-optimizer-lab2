@@ -13,6 +13,11 @@
 #   VLLM_URL   — vLLM URL    (default: http://localhost:8000)
 #   OUT        — output dir  (default: ./results)
 #   SKIP_LONG  — set to 1 to skip 64K/128K long-context tests
+#   TP2        — set to 1 to run Phase F (tensor parallelism TP=2 on both GPUs)
+#
+# Phase F usage:
+#   TP2=1 MODEL=/workspace/Qwen3-8B ./run_all_tests.sh
+#   Run after Phases A-E complete. Kills both engines and runs TP=2 on each.
 # =============================================================================
 
 set -euo pipefail
@@ -22,6 +27,7 @@ SGLANG_URL="${SGLANG_URL:-http://localhost:30000}"
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
 OUT="${OUT:-./results}"
 SKIP_LONG="${SKIP_LONG:-0}"
+TP2="${TP2:-0}"
 
 GREEN="\033[0;32m"
 YELLOW="\033[1;33m"
@@ -267,6 +273,118 @@ if [ -n "$SGLANG_JSON" ] && [ -n "$VLLM_JSON" ]; then
     ok "E1 complete"
 else
     info "Skipping compare — one or both default sweep result files not found"
+fi
+
+# =============================================================================
+# PHASE F — Tensor Parallelism TP=2 (both GPUs on one engine)
+# =============================================================================
+
+if [ "$TP2" = "1" ]; then
+    banner "PHASE F: Tensor Parallelism TP=2"
+    echo "  Both GPUs are now used by a single engine."
+    echo "  Expected: ~1.95x throughput vs single GPU (NVLink 4.0 on H100 SXM5/NVL)"
+    echo ""
+
+    # F1 — SGLang TP=2
+    pause "Stop all running servers. Start SGLang with TP=2 across both GPUs:
+
+  CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \\
+    --model-path $MODEL \\
+    --port 30000 \\
+    --chat-template qwen3 \\
+    --tp-size 2
+
+  Wait until you see 'Server is ready', then press ENTER."
+
+    wait_for_server "$SGLANG_URL" "SGLang TP=2"
+
+    banner "F1: SGLang TP=2 — Quick sweep (validation)"
+    python -m inference_optimizer sweep \
+        --quick \
+        --engine sglang \
+        --model "$MODEL" \
+        --sglang-url "$SGLANG_URL" \
+        --output-dir "$OUT/sglang_tp2_quick"
+    ok "F1 complete → $OUT/sglang_tp2_quick/charts/"
+
+    banner "F2: SGLang TP=2 — Peak sweep (saturation cliff)"
+    python -m inference_optimizer sweep \
+        --peak \
+        --engine sglang \
+        --model "$MODEL" \
+        --sglang-url "$SGLANG_URL" \
+        --output-dir "$OUT/sglang_tp2_peak"
+    ok "F2 complete → $OUT/sglang_tp2_peak/charts/"
+
+    banner "F3: SGLang TP=2 — Full default sweep"
+    python -m inference_optimizer sweep \
+        --engine sglang \
+        --model "$MODEL" \
+        --sglang-url "$SGLANG_URL" \
+        --output-dir "$OUT/sglang_tp2_default"
+    ok "F3 complete → $OUT/sglang_tp2_default/charts/"
+
+    # F4 — vLLM TP=2
+    pause "Stop SGLang. Now start vLLM with TP=2 across both GPUs:
+
+  CUDA_VISIBLE_DEVICES=0,1 vllm serve $MODEL \\
+    --port 8000 \\
+    --override-generation-config '{\"enable_thinking\": false}' \\
+    --tensor-parallel-size 2
+
+  Wait until you see 'Application startup complete', then press ENTER."
+
+    wait_for_server "$VLLM_URL" "vLLM TP=2"
+
+    banner "F4: vLLM TP=2 — Quick sweep (validation)"
+    python -m inference_optimizer sweep \
+        --quick \
+        --engine vllm \
+        --model "$MODEL" \
+        --vllm-url "$VLLM_URL" \
+        --output-dir "$OUT/vllm_tp2_quick"
+    ok "F4 complete → $OUT/vllm_tp2_quick/charts/"
+
+    banner "F5: vLLM TP=2 — Peak sweep (saturation cliff)"
+    python -m inference_optimizer sweep \
+        --peak \
+        --engine vllm \
+        --model "$MODEL" \
+        --vllm-url "$VLLM_URL" \
+        --output-dir "$OUT/vllm_tp2_peak"
+    ok "F5 complete → $OUT/vllm_tp2_peak/charts/"
+
+    banner "F6: vLLM TP=2 — Full default sweep"
+    python -m inference_optimizer sweep \
+        --engine vllm \
+        --model "$MODEL" \
+        --vllm-url "$VLLM_URL" \
+        --output-dir "$OUT/vllm_tp2_default"
+    ok "F6 complete → $OUT/vllm_tp2_default/charts/"
+
+    # F7 — Compare 1GPU vs TP=2 for each engine
+    banner "F7: Compare 1-GPU vs TP=2 — SGLang"
+    SGLANG_1GPU_JSON=$(ls -t "$OUT/sglang_default"/*.json 2>/dev/null | head -1 || echo "")
+    SGLANG_TP2_JSON=$(ls -t "$OUT/sglang_tp2_default"/*.json 2>/dev/null | head -1 || echo "")
+    if [ -n "$SGLANG_1GPU_JSON" ] && [ -n "$SGLANG_TP2_JSON" ]; then
+        python -m inference_optimizer compare \
+            --baseline "$SGLANG_1GPU_JSON" \
+            --optimized "$SGLANG_TP2_JSON"
+        ok "F7 SGLang 1GPU vs TP=2 complete"
+    fi
+
+    banner "F8: Compare 1-GPU vs TP=2 — vLLM"
+    VLLM_1GPU_JSON=$(ls -t "$OUT/vllm_default"/*.json 2>/dev/null | head -1 || echo "")
+    VLLM_TP2_JSON=$(ls -t "$OUT/vllm_tp2_default"/*.json 2>/dev/null | head -1 || echo "")
+    if [ -n "$VLLM_1GPU_JSON" ] && [ -n "$VLLM_TP2_JSON" ]; then
+        python -m inference_optimizer compare \
+            --baseline "$VLLM_1GPU_JSON" \
+            --optimized "$VLLM_TP2_JSON"
+        ok "F8 vLLM 1GPU vs TP=2 complete"
+    fi
+
+else
+    info "Skipping Phase F (TP2 not set). To run: TP2=1 MODEL=$MODEL ./run_all_tests.sh"
 fi
 
 # =============================================================================
