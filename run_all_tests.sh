@@ -133,8 +133,7 @@ banner "PHASE B: vLLM Sweeps"
 
 pause "Stop SGLang (Ctrl+C in its terminal), then start vLLM:
 
-  python -m vllm.entrypoints.openai.api_server \\
-    --model $MODEL \\
+  vllm serve $MODEL \\
     --port 8000 \\
     --override-generation-config '{\"enable_thinking\": false}'
 
@@ -186,8 +185,7 @@ pause "Now start BOTH servers simultaneously (two terminals):
       --chat-template qwen3
 
   Terminal 2 — vLLM:
-    python -m vllm.entrypoints.openai.api_server \\
-      --model $MODEL \\
+    vllm serve $MODEL \\
       --port 8000 \\
       --override-generation-config '{\"enable_thinking\": false}'
 

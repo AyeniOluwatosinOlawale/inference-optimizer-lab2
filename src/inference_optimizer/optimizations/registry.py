@@ -593,16 +593,18 @@ def generate_server_command(
             all_flags.update(opt.sglang_server_flags)
 
     if engine == "vllm":
+        # latest vLLM uses `vllm serve` entrypoint
         cmd_parts = [
-            f"python -m vllm.entrypoints.openai.api_server",
-            f"--model {model}",
+            f"vllm serve {model}",
             f"--port {url_port}",
+            f"--override-generation-config '{{\"enable_thinking\": false}}'",
         ]
     else:
         cmd_parts = [
             f"python -m sglang.launch_server",
             f"--model-path {model}",
             f"--port {url_port}",
+            f"--chat-template qwen3",
         ]
 
     for flag, value in all_flags.items():
