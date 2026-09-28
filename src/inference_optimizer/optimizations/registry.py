@@ -604,7 +604,6 @@ def generate_server_command(
             f"python -m sglang.launch_server",
             f"--model-path {model}",
             f"--port {url_port}",
-            f"--chat-template qwen3",
         ]
 
     for flag, value in all_flags.items():

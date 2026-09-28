@@ -136,6 +136,8 @@ class SweepRunner:
         for engine in cfg.engines:
             for workload in cfg.workloads:
                 for context_tokens in cfg.context_lengths:
+                    baseline_cell = None
+                    prev_concurrency_cell = None
                     for concurrency in cfg.concurrencies:
                         done += 1
                         req = check_cell(context_tokens, concurrency)
@@ -157,6 +159,21 @@ class SweepRunner:
                             flush=True,
                         )
                         cell = await self.run_cell(engine, context_tokens, concurrency, workload)
+
+                        # Re-classify with context now that we have baseline and prev
+                        bottleneck, confidence, reason = classify(
+                            cell,
+                            baseline_cell=baseline_cell,
+                            prev_concurrency_cell=prev_concurrency_cell,
+                        )
+                        cell.bottleneck = bottleneck
+                        cell.bottleneck_confidence = confidence
+                        cell.bottleneck_reason = reason
+
+                        if baseline_cell is None:
+                            baseline_cell = cell
+                        prev_concurrency_cell = cell
+
                         cells.append(cell)
                         print(
                             f"TTFT p50={cell.ttft_p50_ms:.0f}ms "
