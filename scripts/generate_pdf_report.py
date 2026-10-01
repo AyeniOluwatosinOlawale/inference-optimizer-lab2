@@ -285,13 +285,22 @@ def metrics_summary_table(raw_records: list[dict],
     """
     AIPerf-style metrics summary table:
     Metric | Avg | Min | Max | p50 | p90 | p99 | Std
-    Shows: TTFT, TPOT, ITL, E2E latency, Output TPS per request.
+    Shows: TTFT, TPOT, ITL, E2E latency, Queue Wait, Output TPS per request.
     """
     ok = [r for r in raw_records if not r.get("error")]
     if filter_eng: ok = [r for r in ok if r["engine"] == filter_eng]
     if filter_ctx: ok = [r for r in ok if r["context_tokens"] == filter_ctx]
     if filter_c:   ok = [r for r in ok if r["concurrency"] == filter_c]
     if filter_wl:  ok = [r for r in ok if r["workload"] == filter_wl]
+
+    # Compute counts for success/error row using the same filters applied to raw_records
+    all_filtered = [r for r in raw_records
+                    if (not filter_eng or r.get("engine") == filter_eng)
+                    and (not filter_ctx or r.get("context_tokens") == filter_ctx)
+                    and (not filter_c   or r.get("concurrency") == filter_c)
+                    and (not filter_wl  or r.get("workload") == filter_wl)]
+    n_total = len(all_filtered)
+    n_err   = n_total - len(ok)
 
     def stat_row(label: str, vals: list, unit: str, decimals: int = 1) -> list:
         if not vals:
@@ -311,6 +320,7 @@ def metrics_summary_table(raw_records: list[dict],
     tpot  = [r["tpot_ms"]  for r in ok if r.get("tpot_ms")  is not None]
     itl   = [r["itl_mean_ms"] for r in ok if r.get("itl_mean_ms") is not None]
     e2e   = [r["e2e_ms"]   for r in ok if r.get("e2e_ms")   is not None]
+    queue = [r["queue_ms"] for r in ok if r.get("queue_ms") is not None]
     otps  = [r["output_tps"] for r in ok if r.get("output_tps")]
     toks  = [r["output_tokens_actual"] for r in ok if r.get("output_tokens_actual")]
 
@@ -321,11 +331,15 @@ def metrics_summary_table(raw_records: list[dict],
         stat_row("Time Per Output Token", tpot, "ms"),
         stat_row("Inter-Token Latency", itl, "ms"),
         stat_row("End-to-End Latency", e2e, "ms", 0),
+        stat_row("Queue Wait Time", queue, "ms"),
         stat_row("Output TPS / request", otps, "tok/s", 1),
         stat_row("Output Tokens", toks, "tokens", 0),
     ]
     # filter out empty rows
     data = [data[0]] + [r for r in data[1:] if r[1] != "—"]
+
+    # Append success/error summary row
+    data.append(["Success / Error", str(len(ok)), str(n_err), "—", "—", "—", "—", "—"])
 
     cw = [4.5*cm] + [1.55*cm]*7
     t = Table(data, colWidths=cw, repeatRows=1)
@@ -336,42 +350,95 @@ def metrics_summary_table(raw_records: list[dict],
 
 
 def pareto_table(cells: list[dict], engine: str, context_tokens: int,
-                 workload: str = "random") -> Table:
-    """Pareto trade-off: concurrency sweep → TPS, TTFT p50, TPOT p50, interpretation."""
+                 workload: str = "random") -> list:
+    """
+    Pareto trade-off: concurrency sweep → two tables (Throughput/TTFT and TPOT/E2E/SLA).
+    Returns a list of flowables (Tables + Spacers + Paragraphs).
+    """
     subset = [r for r in cells
               if r["engine"] == engine
               and r["ctx"] == context_tokens
               and r["wl"] == workload]
     subset.sort(key=lambda r: r["c"])
 
-    header = ["Concurrency", "TPS", "TTFT p50 (ms)", "TPOT p50 (ms)", "Trade-off"]
-    data = [header]
+    # Table A — Throughput & TTFT
+    header_a = ["c", "TPS", "TTFT p50 (ms)", "TTFT p90 (ms)", "TTFT p99 (ms)"]
+    data_a = [header_a]
     for r in subset:
-        c = r["c"]
-        if c <= 1:
-            interp = "Low load — latency optimal"
-        elif c <= 8:
-            interp = "Balanced throughput/latency"
-        elif c <= 32:
-            interp = "High throughput, rising latency"
+        data_a.append([
+            str(r["c"]),
+            _f(r["tps"], 0),
+            _f(r["ttft_p50"]),
+            _f(r["ttft_p90"]),
+            _f(r["ttft_p99"]),
+        ])
+    cw_a = [1.5*cm, 2.0*cm, 2.8*cm, 2.8*cm, 2.8*cm]
+    t_a = Table(data_a, colWidths=cw_a, repeatRows=1)
+    ts_a = TableStyle(list(BASE_TS._cmds))
+    ts_a.add("ALIGN", (0,1), (-1,-1), "CENTER")
+    t_a.setStyle(ts_a)
+
+    # Table B — TPOT, E2E & SLA
+    header_b = ["c", "TPOT p50 (ms)", "TPOT p90 (ms)", "TPOT p99 (ms)", "E2E p99 (ms)", "Queue p50 (ms)", "SLA"]
+    data_b = [header_b]
+    for r in subset:
+        tpot_p99 = r.get("tpot_p99", 0)
+        ttft_p50  = r.get("ttft_p50", 0)
+        e2e_p99   = r.get("e2e_p99", 0)
+        if tpot_p99 <= SLA["tpot_ms"] and ttft_p50 <= SLA["ttft_ms"] and e2e_p99 <= SLA["e2e_ms"]:
+            sla = "✓"
+        elif tpot_p99 > SLA["tpot_ms"]:
+            sla = "✗ TPOT"
+        elif ttft_p50 > SLA["ttft_ms"]:
+            sla = "✗ TTFT"
         else:
-            interp = "Saturation — SLA risk"
-        data.append([str(c), _f(r["tps"], 0), _f(r["ttft_p50"]),
-                     _f(r["tpot_p50"]), interp])
-    cw = [2.2*cm, 1.8*cm, 2.5*cm, 2.5*cm, 5.0*cm]
-    t = Table(data, colWidths=cw, repeatRows=1)
-    ts = TableStyle(list(BASE_TS._cmds))
-    # Highlight saturation rows
-    for i, row in enumerate(data[1:], 1):
-        if "Saturation" in row[-1]:
-            ts.add("BACKGROUND", (4,i), (4,i), colors.HexColor("#FFF0E0"))
-            ts.add("TEXTCOLOR",  (4,i), (4,i), colors.HexColor("#CC5500"))
-        elif "Balanced" in row[-1]:
-            ts.add("BACKGROUND", (4,i), (4,i), colors.HexColor("#E8FFF0"))
-    ts.add("ALIGN", (0,1), (-1,-1), "CENTER")
-    ts.add("ALIGN", (4,1), (4,-1), "LEFT")
-    t.setStyle(ts)
-    return t
+            sla = "✗ E2E"
+        q_p50 = r.get("q_p50", None)
+        data_b.append([
+            str(r["c"]),
+            _f(r.get("tpot_p50")),
+            _f(r.get("tpot_p90")),
+            _f(tpot_p99),
+            _f(e2e_p99),
+            _f(q_p50) if q_p50 is not None else "—",
+            sla,
+        ])
+    cw_b = [1.5*cm, 2.2*cm, 2.2*cm, 2.2*cm, 2.2*cm, 2.2*cm, 1.6*cm]
+    t_b = Table(data_b, colWidths=cw_b, repeatRows=1)
+    ts_b = TableStyle(list(BASE_TS._cmds))
+    for i, row in enumerate(data_b[1:], 1):
+        sla_val = row[-1]
+        if sla_val == "✓":
+            ts_b.add("TEXTCOLOR", (-1,i), (-1,i), PASS_GRN)
+            ts_b.add("FONTNAME",  (-1,i), (-1,i), "Helvetica-Bold")
+        elif sla_val.startswith("✗"):
+            ts_b.add("TEXTCOLOR",  (-1,i), (-1,i), FAIL_RED)
+            ts_b.add("FONTNAME",   (-1,i), (-1,i), "Helvetica-Bold")
+            ts_b.add("BACKGROUND", (0,i),  (-1,i),  colors.HexColor("#FFF5F5"))
+    ts_b.add("ALIGN", (0,1), (-1,-1), "CENTER")
+    t_b.setStyle(ts_b)
+
+    # Interpretation note
+    interp_items = [
+        "c ≤ 1: Low load — latency optimal",
+        "c 2–8: Balanced throughput/latency",
+        "c 9–32: High throughput, rising latency",
+        "c > 32: Saturation — SLA risk",
+    ]
+    note_text = "  ·  ".join(interp_items)
+
+    from reportlab.lib.styles import getSampleStyleSheet
+    note_style = ParagraphStyle("note", fontName="Helvetica-Oblique",
+        fontSize=7.5, leading=11, textColor=colors.HexColor("#666666"), spaceAfter=4)
+
+    return [
+        t_a,
+        Spacer(1, 6),
+        t_b,
+        Spacer(1, 4),
+        Paragraph(note_text, note_style),
+        Spacer(1, 4),
+    ]
 
 
 # ─── Chart helpers ────────────────────────────────────────────────────────────
@@ -434,24 +501,41 @@ def load_raw(folder: Path) -> list[dict]:
 
 def load_cells(folder: Path) -> list[dict]:
     raw = load_raw(folder)
-    ok  = [r for r in raw if not r.get("error")]
-    groups: dict = defaultdict(list)
-    for r in ok:
+    # Group ALL records (including errors) by key for error counting
+    all_groups: dict = defaultdict(list)
+    for r in raw:
         key = (r["engine"], r["context_tokens"], r["concurrency"], r["workload"])
-        groups[key].append(r)
+        all_groups[key].append(r)
+
+    ok_records = [r for r in raw if not r.get("error")]
+    ok_groups: dict = defaultdict(list)
+    for r in ok_records:
+        key = (r["engine"], r["context_tokens"], r["concurrency"], r["workload"])
+        ok_groups[key].append(r)
+
     rows = []
-    for (eng, ctx, c, wl), rs in sorted(groups.items()):
-        ttft = [r["ttft_ms"] for r in rs if r.get("ttft_ms")]
-        tpot = [r["tpot_ms"] for r in rs if r.get("tpot_ms")]
-        e2e  = [r["e2e_ms"]  for r in rs if r.get("e2e_ms")]
-        total = sum(r.get("output_tokens_actual",0) for r in rs)
-        max_e2e_s = (max(r["e2e_ms"] for r in rs)/1000) if rs else 1
+    for (eng, ctx, c, wl), rs in sorted(all_groups.items()):
+        ok_rs = ok_groups.get((eng, ctx, c, wl), [])
+        ttft = [r["ttft_ms"] for r in ok_rs if r.get("ttft_ms")]
+        tpot = [r["tpot_ms"] for r in ok_rs if r.get("tpot_ms")]
+        e2e  = [r["e2e_ms"]  for r in ok_rs if r.get("e2e_ms")]
+        itl  = [r["itl_mean_ms"] for r in ok_rs if r.get("itl_mean_ms")]
+        q    = [r["queue_ms"]    for r in ok_rs if r.get("queue_ms")]
+        n_err = sum(1 for r in rs if r.get("error"))
+        total = sum(r.get("output_tokens_actual", 0) for r in ok_rs)
+        max_e2e_s = (max(r["e2e_ms"] for r in ok_rs)/1000) if ok_rs else 1
         rows.append({
             "engine": eng, "ctx": ctx, "c": c, "wl": wl,
             "tps":      total / max_e2e_s if max_e2e_s else 0,
-            "ttft_p50": _pct(ttft,50), "ttft_p90": _pct(ttft,90), "ttft_p99": _pct(ttft,99),
-            "tpot_p50": _pct(tpot,50), "tpot_p90": _pct(tpot,90), "tpot_p99": _pct(tpot,99),
-            "e2e_p50":  _pct(e2e,50),  "e2e_p99":  _pct(e2e,99),
+            "ttft_p50": _pct(ttft, 50), "ttft_p90": _pct(ttft, 90), "ttft_p99": _pct(ttft, 99),
+            "tpot_p50": _pct(tpot, 50), "tpot_p90": _pct(tpot, 90), "tpot_p99": _pct(tpot, 99),
+            "e2e_p50":  _pct(e2e,  50), "e2e_p99":  _pct(e2e,  99),
+            "e2e_p90":  _pct(e2e,  90),
+            "itl_p50":  _pct(itl,  50), "itl_p99":  _pct(itl,  99),
+            "q_p50":    _pct(q,    50), "q_p99":    _pct(q,    99),
+            "n_total":  len(rs),
+            "n_errors": n_err,
+            "error_pct": 100 * n_err / len(rs) if rs else 0,
         })
     return rows
 
@@ -622,7 +706,7 @@ def uc1(results_dir: Path, st: dict) -> list:
         st["body"]))
     cells = load_cells(results_dir / "sglang_default")
     story.append(Spacer(1, 4))
-    story.append(pareto_table(cells, "sglang", 1024, "random"))
+    story += pareto_table(cells, "sglang", 1024, "random")
     story.append(Spacer(1, 8))
 
     charts_dir = results_dir / "sglang_default" / "charts"
@@ -636,6 +720,48 @@ def uc1(results_dir: Path, st: dict) -> list:
         charts_dir / "heatmap_tpot_p50_ms_sglang_random.png",
         "Figure 1.3: TTFT p50 heatmap (ctx × concurrency)",
         "Figure 1.4: TPOT p50 heatmap (ctx × concurrency)", st)
+
+    # vLLM Pareto comparison
+    story += h("Pareto Curve Analysis — vLLM, ctx=1024, random", st, level=2)
+    story.append(Paragraph("vLLM equivalent sweep for direct comparison:", st["body"]))
+    vllm_cells = load_cells(results_dir / "vllm_default")
+    story += pareto_table(vllm_cells, "vllm", 1024, "random")
+    story.append(Spacer(1, 8))
+
+    # Shared-prefix TTFT comparison table
+    story += h("Shared-Prefix vs Random TTFT Speedup — SGLang, c=4", st, level=2)
+    story.append(Paragraph(
+        "SGLang RadixAttention reuses cached KV states for prompts with a shared prefix, "
+        "dramatically reducing TTFT. The table below shows the speedup at increasing context lengths "
+        "for moderate concurrency (c=4).", st["body"]))
+    sglang_raw = load_raw(results_dir / "sglang_default")
+    ctx_levels = [2048, 4096, 8192, 16384, 32768]
+    sp_data = [["Ctx", "Random TTFT p50", "SP TTFT p50", "Speedup", "Random TTFT p99", "SP TTFT p99"]]
+    for ctx in ctx_levels:
+        rand_ttft = sorted(
+            r["ttft_ms"] for r in sglang_raw
+            if not r.get("error") and r.get("engine") == "sglang"
+            and r.get("context_tokens") == ctx and r.get("concurrency") == 4
+            and r.get("workload") == "random" and r.get("ttft_ms") is not None
+        )
+        sp_ttft = sorted(
+            r["ttft_ms"] for r in sglang_raw
+            if not r.get("error") and r.get("engine") == "sglang"
+            and r.get("context_tokens") == ctx and r.get("concurrency") == 4
+            and r.get("workload") == "shared_prefix" and r.get("ttft_ms") is not None
+        )
+        rand_p50 = _pct(rand_ttft, 50)
+        sp_p50   = _pct(sp_ttft, 50)
+        rand_p99 = _pct(rand_ttft, 99)
+        sp_p99   = _pct(sp_ttft, 99)
+        speedup  = f"{rand_p50/sp_p50:.1f}×" if sp_p50 > 0 else "—"
+        sp_data.append([
+            str(ctx),
+            _f(rand_p50), _f(sp_p50), speedup,
+            _f(rand_p99), _f(sp_p99),
+        ])
+    story.append(simple_table(sp_data, [1.5*cm, 2.5*cm, 2.3*cm, 1.8*cm, 2.5*cm, 2.3*cm]))
+    story.append(Spacer(1, 8))
 
     story += takeaways_box([
         "SGLang achieves peak 2,148 tok/s at ctx=1024, c=1, random — decode-bandwidth bound.",
@@ -694,32 +820,36 @@ def uc2(results_dir: Path, st: dict) -> list:
         st["body_sm"]))
     story.append(Spacer(1, 4))
 
-    data = [["Percentile", "SGLang TTFT (ms)", "vLLM TTFT (ms)",
-             "SGLang TPOT (ms)", "vLLM TPOT (ms)"]]
-    for eng_a, eng_b in [("sglang", "vllm")]:
-        sg_ttft = sorted(r["ttft_ms"] for r in raw
-                         if not r.get("error") and r["engine"]=="sglang"
-                         and r["context_tokens"]==2048 and r["concurrency"]==8
-                         and r["workload"]=="random" and r.get("ttft_ms"))
-        vl_ttft = sorted(r["ttft_ms"] for r in raw
-                         if not r.get("error") and r["engine"]=="vllm"
-                         and r["context_tokens"]==2048 and r["concurrency"]==8
-                         and r["workload"]=="random" and r.get("ttft_ms"))
-        sg_tpot = sorted(r["tpot_ms"] for r in raw
-                         if not r.get("error") and r["engine"]=="sglang"
-                         and r["context_tokens"]==2048 and r["concurrency"]==8
-                         and r["workload"]=="random" and r.get("tpot_ms"))
-        vl_tpot = sorted(r["tpot_ms"] for r in raw
-                         if not r.get("error") and r["engine"]=="vllm"
-                         and r["context_tokens"]==2048 and r["concurrency"]==8
-                         and r["workload"]=="random" and r.get("tpot_ms"))
-        for p in [25, 50, 75, 90, 99]:
-            data.append([
-                f"p{p}",
-                _f(_pct(sg_ttft, p)), _f(_pct(vl_ttft, p)),
-                _f(_pct(sg_tpot, p)), _f(_pct(vl_tpot, p)),
-            ])
-    story.append(simple_table(data, [1.5*cm, 3.0*cm, 2.8*cm, 3.0*cm, 2.8*cm]))
+    # Extract per-engine lists for TTFT, TPOT, E2E, ITL
+    def _extract(metric_key, engine):
+        return sorted(
+            r[metric_key] for r in raw
+            if not r.get("error") and r["engine"] == engine
+            and r["context_tokens"] == 2048 and r["concurrency"] == 8
+            and r["workload"] == "random" and r.get(metric_key) is not None
+        )
+
+    sg_ttft = _extract("ttft_ms", "sglang")
+    vl_ttft = _extract("ttft_ms", "vllm")
+    sg_tpot = _extract("tpot_ms", "sglang")
+    vl_tpot = _extract("tpot_ms", "vllm")
+    sg_e2e  = _extract("e2e_ms",  "sglang")
+    vl_e2e  = _extract("e2e_ms",  "vllm")
+    sg_itl  = _extract("itl_mean_ms", "sglang")
+    vl_itl  = _extract("itl_mean_ms", "vllm")
+
+    data = [["Percentile", "SGLang TTFT", "vLLM TTFT", "SGLang TPOT", "vLLM TPOT",
+             "SGLang E2E", "vLLM E2E", "SGLang ITL", "vLLM ITL"]]
+    for p in [25, 50, 75, 90, 99]:
+        data.append([
+            f"p{p}",
+            _f(_pct(sg_ttft, p)), _f(_pct(vl_ttft, p)),
+            _f(_pct(sg_tpot, p)), _f(_pct(vl_tpot, p)),
+            _f(_pct(sg_e2e,  p), 0), _f(_pct(vl_e2e,  p), 0),
+            _f(_pct(sg_itl,  p)), _f(_pct(vl_itl,  p)),
+        ])
+    story.append(simple_table(data, [1.4*cm, 2.0*cm, 2.0*cm, 2.0*cm, 2.0*cm,
+                                     2.0*cm, 2.0*cm, 2.0*cm, 1.8*cm]))
     story.append(Spacer(1, 8))
 
     story += h("Full Metrics Summary — SGLang, ctx=2048, c=8, random", st, level=2)
@@ -792,7 +922,7 @@ def uc3(results_dir: Path, st: dict) -> list:
     subset = [r for r in cells
               if r["c"] in [1, 4, 16, 32] and r["ctx"] in [512, 2048, 8192]
               and r["wl"] == "random"]
-    header = ["Engine", "Ctx", "C", "TPS", "TTFT p50", "TTFT p99", "TPOT p50", "TPOT p99"]
+    header = ["Engine", "Ctx", "C", "TPS", "TTFT p50", "TTFT p99", "TPOT p50", "TPOT p99", "E2E p50", "E2E p99"]
     data = [header]
     for r in subset:
         data.append([
@@ -800,8 +930,9 @@ def uc3(results_dir: Path, st: dict) -> list:
             str(r["ctx"]), str(r["c"]),
             _f(r["tps"],0), _f(r["ttft_p50"]), _f(r["ttft_p99"]),
             _f(r["tpot_p50"]), _f(r["tpot_p99"]),
+            _f(r["e2e_p50"]), _f(r["e2e_p99"]),
         ])
-    cw = [1.5*cm, 1.4*cm, 1.0*cm, 1.6*cm, 2.0*cm, 2.0*cm, 2.0*cm, 2.0*cm]
+    cw = [1.3*cm, 1.2*cm, 0.8*cm, 1.4*cm, 1.6*cm, 1.6*cm, 1.6*cm, 1.6*cm, 1.6*cm, 1.6*cm]
     t = Table(data, colWidths=cw, repeatRows=1)
     ts = TableStyle(list(BASE_TS._cmds))
     for i, row in enumerate(data[1:], 1):
@@ -855,23 +986,33 @@ def uc4(metrics_data: dict, results_dir: Path, st: dict) -> list:
     subset.sort(key=lambda r: (r["context_tokens"], r["concurrency"], r["engine"]))
 
     header = ["Engine","Ctx","C","Workload","Success%","Goodput%",
-              "TTFT p50","TTFT p99","TPOT p99","SLA Status"]
+              "TTFT p50","TTFT p99","TPOT p99","E2E p99","SLA Status"]
     data = [header]
     for r in subset:
         breaches = []
         if r["ttft_p50_ms"] > SLA["ttft_ms"]: breaches.append("TTFT")
         if r["tpot_p99_ms"] > SLA["tpot_ms"]: breaches.append("TPOT")
         if r["e2e_p50_ms"]  > SLA["e2e_ms"]:  breaches.append("E2E")
-        status = "✗ " + " ".join(breaches) if breaches else "✓ Pass"
+        if r.get("e2e_p99_ms", 0) > SLA["e2e_ms"]: breaches.append("E2E")
+        # deduplicate
+        seen = set()
+        unique_breaches = []
+        for b in breaches:
+            if b not in seen:
+                seen.add(b)
+                unique_breaches.append(b)
+        status = "✗ " + " ".join(unique_breaches) if unique_breaches else "✓ Pass"
         data.append([
             "SGLang" if r["engine"]=="sglang" else "vLLM",
             str(r["context_tokens"]), str(r["concurrency"]),
             r["workload"][:10],
             _f(r["success_rate_pct"]), _f(r["goodput_pct"]),
             _f(r["ttft_p50_ms"]), _f(r["ttft_p99_ms"]),
-            _f(r["tpot_p99_ms"]), status,
+            _f(r["tpot_p99_ms"]),
+            _f(r.get("e2e_p99_ms", None)),
+            status,
         ])
-    cw = [1.3*cm, 1.2*cm, 0.9*cm, 1.6*cm, 1.3*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.5*cm]
+    cw = [1.2*cm, 1.1*cm, 0.8*cm, 1.5*cm, 1.2*cm, 1.3*cm, 1.3*cm, 1.3*cm, 1.3*cm, 1.4*cm, 1.4*cm]
     t = Table(data, colWidths=cw, repeatRows=1)
     ts = TableStyle(list(BASE_TS._cmds))
     for i, row in enumerate(data[1:], 1):
@@ -1057,25 +1198,47 @@ def uc7(results_dir: Path, st: dict) -> list:
     cells = load_cells(results_dir / "sglang_default")
     subset = [r for r in cells if r["ctx"]==1024 and r["wl"]=="random"]
     subset.sort(key=lambda r: r["c"])
-    data = [["Slice", "Concurrency", "TPS", "TTFT p50 (ms)", "TPOT p50 (ms)",
-             "TPOT p99 (ms)", "TPOT SLA"]]
+
+    data = [["Slice", "c", "TPS", "TTFT p50 (ms)", "TTFT p99 (ms)",
+             "TPOT p50 (ms)", "TPOT p99 (ms)", "E2E p99 (ms)", "Queue p50 (ms)", "SLA"]]
     for i, r in enumerate(subset):
-        sla_ok = "✓" if r["tpot_p99"] <= SLA["tpot_ms"] else "✗ breach"
+        tpot_p99 = r.get("tpot_p99", 0)
+        ttft_p50  = r.get("ttft_p50", 0)
+        e2e_p99   = r.get("e2e_p99", 0)
+        if tpot_p99 <= SLA["tpot_ms"] and ttft_p50 <= SLA["ttft_ms"] and e2e_p99 <= SLA["e2e_ms"]:
+            sla_str = "✓"
+        elif tpot_p99 > SLA["tpot_ms"]:
+            sla_str = "✗ TPOT"
+        elif ttft_p50 > SLA["ttft_ms"]:
+            sla_str = "✗ TTFT"
+        else:
+            sla_str = "✗ E2E"
+        q_p50_val = r.get("q_p50", None)
         data.append([
             str(i+1), str(r["c"]),
-            _f(r["tps"],0), _f(r["ttft_p50"]), _f(r["tpot_p50"]),
-            _f(r["tpot_p99"]), sla_ok,
+            _f(r["tps"], 0), _f(r["ttft_p50"]), _f(r["ttft_p99"]),
+            _f(r["tpot_p50"]), _f(tpot_p99),
+            _f(e2e_p99),
+            _f(q_p50_val) if q_p50_val is not None else "—",
+            sla_str,
         ])
-    t = Table(data, colWidths=[1.2*cm, 2.0*cm, 1.8*cm, 2.5*cm, 2.5*cm, 2.5*cm, 1.8*cm],
-              repeatRows=1)
+    cw = [1.0*cm, 1.0*cm, 1.6*cm, 2.0*cm, 2.0*cm, 2.0*cm, 2.0*cm, 1.8*cm, 1.8*cm, 1.8*cm]
+    t = Table(data, colWidths=cw, repeatRows=1)
     ts = TableStyle(list(BASE_TS._cmds))
     for i, row in enumerate(data[1:], 1):
-        if "✗" in row[-1]:
+        if row[-1].startswith("✗"):
             ts.add("TEXTCOLOR",  (-1,i),(-1,i), FAIL_RED)
             ts.add("FONTNAME",   (-1,i),(-1,i), "Helvetica-Bold")
             ts.add("BACKGROUND", (0,i),(-1,i),  colors.HexColor("#FFF5F5"))
+        elif row[-1] == "✓":
+            ts.add("TEXTCOLOR",  (-1,i),(-1,i), PASS_GRN)
+            ts.add("FONTNAME",   (-1,i),(-1,i), "Helvetica-Bold")
     t.setStyle(ts)
     story.append(t)
+    story.append(Spacer(1, 8))
+
+    story += h("Pareto Analysis — SGLang, ctx=1024, random", st, level=2)
+    story += pareto_table(cells, "sglang", 1024, "random")
     story.append(Spacer(1, 8))
 
     # Warm-up / cold vs warm comparison
@@ -1202,20 +1365,22 @@ def appendix(metrics_data: dict, st: dict) -> list:
         if not rows:
             continue
         story += h(label, st, level=2)
-        header = ["Engine","Ctx","C","Workload","Ok%","Goodput%",
-                  "TTFT p50","TTFT p99","TPOT p50","TPOT p99"]
+        header = ["Engine","Ctx","C","WL","Ok%","Gdpt%",
+                  "TTFT p50","TTFT p99","TPOT p50","TPOT p99","E2E p99","Q p50"]
         data = [header]
         for r in rows:
             data.append([
                 "SGLang" if r["engine"]=="sglang" else "vLLM",
                 str(r["context_tokens"]), str(r["concurrency"]),
-                r["workload"][:12],
+                r["workload"][:10],
                 _f(r["success_rate_pct"]), _f(r["goodput_pct"]),
                 _f(r["ttft_p50_ms"]), _f(r["ttft_p99_ms"]),
                 _f(r["tpot_p50_ms"]), _f(r["tpot_p99_ms"]),
+                _f(r.get("e2e_p99_ms", None)),
+                _f(r.get("queue_p50_ms", None)),
             ])
-        cw = [1.3*cm, 1.4*cm, 0.9*cm, 1.8*cm,
-              1.1*cm, 1.4*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.5*cm]
+        cw = [1.2*cm, 1.2*cm, 0.8*cm, 1.6*cm,
+              1.0*cm, 1.2*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.2*cm]
         t = Table(data, colWidths=cw, repeatRows=1)
         ts = TableStyle(list(BASE_TS._cmds))
         for i, row in enumerate(data[1:], 1):
