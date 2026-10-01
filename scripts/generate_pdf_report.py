@@ -418,7 +418,17 @@ def load_raw(folder: Path) -> list[dict]:
     jsons = sorted(folder.glob("*.json"))
     if not jsons:
         return []
-    raw = json.loads(jsons[-1].read_text())
+    # Pick the file with the most successful (non-error) records; fall back to last.
+    def _good_count(p: Path) -> int:
+        try:
+            data = json.loads(p.read_text())
+            if not isinstance(data, list):
+                return 0
+            return sum(1 for r in data if not r.get("error") and r.get("output_tokens_actual", 0) > 0)
+        except Exception:
+            return 0
+    best = max(jsons, key=_good_count)
+    raw = json.loads(best.read_text())
     return raw if isinstance(raw, list) else []
 
 
